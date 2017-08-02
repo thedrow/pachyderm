@@ -6,7 +6,9 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,11 +17,13 @@ import (
 
 	"github.com/gogo/protobuf/types"
 	pclient "github.com/pachyderm/pachyderm/src/client"
+	"github.com/pachyderm/pachyderm/src/client/auth"
 	"github.com/pachyderm/pachyderm/src/client/pfs"
 	"github.com/pachyderm/pachyderm/src/client/pkg/grpcutil"
 	"github.com/pachyderm/pachyderm/src/client/pkg/require"
 	"github.com/pachyderm/pachyderm/src/client/pkg/uuid"
 	"github.com/pachyderm/pachyderm/src/client/version"
+	authtesting "github.com/pachyderm/pachyderm/src/server/auth/testing"
 	pfssync "github.com/pachyderm/pachyderm/src/server/pkg/sync"
 
 	"golang.org/x/net/context"
@@ -34,7 +38,7 @@ const (
 )
 
 var (
-	port int32 = 30651
+	port int32 = 30653
 )
 
 var testDBs []string
@@ -372,6 +376,51 @@ func TestUpdateProvenance(t *testing.T) {
 	// We shouldn't be able to delete prov3 since it's now a provenance
 	// of other repos.
 	require.YesError(t, client.DeleteRepo(prov3, false))
+}
+
+func TestPutFileIntoOpenCommit(t *testing.T) {
+	t.Parallel()
+	client := getClient(t)
+
+	repo := "test"
+	require.NoError(t, client.CreateRepo(repo))
+
+	_, err := client.PutFile(repo, "master", "foo", strings.NewReader("foo\n"))
+	require.YesError(t, err)
+
+	commit1, err := client.StartCommit(repo, "master")
+	require.NoError(t, err)
+	_, err = client.PutFile(repo, commit1.ID, "foo", strings.NewReader("foo\n"))
+	require.NoError(t, err)
+	require.NoError(t, client.FinishCommit(repo, commit1.ID))
+
+	_, err = client.PutFile(repo, "master", "foo", strings.NewReader("foo\n"))
+	require.YesError(t, err)
+	_, err = client.PutFile(repo, commit1.ID, "foo", strings.NewReader("foo\n"))
+	require.YesError(t, err)
+
+	commit2, err := client.StartCommit(repo, "master")
+	require.NoError(t, err)
+	_, err = client.PutFile(repo, "master", "foo", strings.NewReader("foo\n"))
+	require.NoError(t, err)
+	require.NoError(t, client.FinishCommit(repo, "master"))
+
+	_, err = client.PutFile(repo, "master", "foo", strings.NewReader("foo\n"))
+	require.YesError(t, err)
+	_, err = client.PutFile(repo, commit2.ID, "foo", strings.NewReader("foo\n"))
+	require.YesError(t, err)
+}
+
+func TestCreateInvalidBranchName(t *testing.T) {
+	t.Parallel()
+	client := getClient(t)
+
+	repo := "test"
+	require.NoError(t, client.CreateRepo(repo))
+
+	// Create a branch that's the same length as a commit ID
+	_, err := client.StartCommit(repo, uuid.NewWithoutDashes())
+	require.YesError(t, err)
 }
 
 func TestListRepoWithProvenance(t *testing.T) {
@@ -2101,8 +2150,9 @@ func TestSyncPullPush(t *testing.T) {
 	require.NoError(t, err)
 
 	puller := pfssync.NewPuller()
-	require.NoError(t, puller.Pull(&client, tmpDir, repo1, commit1.ID, "", false, 2))
-	require.NoError(t, puller.CleanUp())
+	require.NoError(t, puller.Pull(&client, tmpDir, repo1, commit1.ID, "", false, 2, nil, ""))
+	_, err = puller.CleanUp()
+	require.NoError(t, err)
 
 	repo2 := "repo2"
 	require.NoError(t, client.CreateRepo(repo2))
@@ -2149,13 +2199,40 @@ func TestSyncPullPush(t *testing.T) {
 	require.NoError(t, err)
 
 	puller = pfssync.NewPuller()
-	require.NoError(t, puller.Pull(&client, tmpDir2, repo1, "master", "", true, 2))
+	require.NoError(t, puller.Pull(&client, tmpDir2, repo1, "master", "", true, 2, nil, ""))
 
 	data, err := ioutil.ReadFile(path.Join(tmpDir2, "dir/bar"))
 	require.NoError(t, err)
 	require.Equal(t, "bar\n", string(data))
 
-	require.NoError(t, puller.CleanUp())
+	_, err = puller.CleanUp()
+	require.NoError(t, err)
+}
+
+func TestSyncEmptyDir(t *testing.T) {
+	t.Parallel()
+	client := getClient(t)
+
+	repo := "repo"
+	require.NoError(t, client.CreateRepo(repo))
+
+	commit, err := client.StartCommit(repo, "master")
+	require.NoError(t, err)
+	require.NoError(t, client.FinishCommit(repo, commit.ID))
+
+	tmpDir, err := ioutil.TempDir("/tmp", "pfs")
+	require.NoError(t, err)
+
+	// We want to make sure that Pull creates an empty directory
+	// when the path that we are cloning is empty.
+	dir := filepath.Join(tmpDir, "tmp")
+
+	puller := pfssync.NewPuller()
+	require.NoError(t, puller.Pull(&client, dir, repo, commit.ID, "", false, 0, nil, ""))
+	_, err = os.Stat(dir)
+	require.NoError(t, err)
+	_, err = puller.CleanUp()
+	require.NoError(t, err)
 }
 
 func generateRandomString(n int) string {
@@ -2175,6 +2252,7 @@ func runServers(t *testing.T, port int32, apiServer pfs.APIServer,
 			func(s *grpc.Server) {
 				pfs.RegisterAPIServer(s, apiServer)
 				pfs.RegisterObjectAPIServer(s, blockAPIServer)
+				auth.RegisterAPIServer(s, &authtesting.InactiveAPIServer{}) // PFS server uses auth API
 				close(ready)
 			},
 			grpcutil.ServeOptions{
@@ -2312,29 +2390,31 @@ func TestFlush2(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ACommit, err := client.StartCommit("A", "")
+	ACommit, err := client.StartCommit("A", "master")
 	require.NoError(t, err)
 	require.NoError(t, client.FinishCommit("A", ACommit.ID))
-	BCommit, err := client.StartCommit("B", "")
+	BCommit, err := client.StartCommit("B", "master")
 	require.NoError(t, err)
 	require.NoError(t, client.FinishCommit("B", BCommit.ID))
 	CCommit, err := client.PfsAPIClient.StartCommit(
 		context.Background(),
 		&pfs.StartCommitRequest{
 			Parent:     pclient.NewCommit("C", ""),
+			Branch:     "master",
 			Provenance: []*pfs.Commit{ACommit, BCommit},
 		},
 	)
 	require.NoError(t, err)
 	require.NoError(t, client.FinishCommit("C", CCommit.ID))
 
-	BCommit, err = client.StartCommit("B", BCommit.ID)
+	BCommit, err = client.StartCommit("B", "master")
 	require.NoError(t, err)
 	require.NoError(t, client.FinishCommit("B", BCommit.ID))
 	CCommit, err = client.PfsAPIClient.StartCommit(
 		context.Background(),
 		&pfs.StartCommitRequest{
-			Parent:     pclient.NewCommit("C", CCommit.ID),
+			Parent:     pclient.NewCommit("C", ""),
+			Branch:     "master",
 			Provenance: []*pfs.Commit{ACommit, BCommit},
 		},
 	)

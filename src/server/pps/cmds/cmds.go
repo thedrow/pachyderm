@@ -17,7 +17,7 @@ import (
 
 	"github.com/fsouza/go-dockerclient"
 	"github.com/gogo/protobuf/jsonpb"
-	pach "github.com/pachyderm/pachyderm/src/client"
+	pachdclient "github.com/pachyderm/pachyderm/src/client"
 	"github.com/pachyderm/pachyderm/src/client/pkg/uuid"
 	ppsclient "github.com/pachyderm/pachyderm/src/client/pps"
 	"github.com/pachyderm/pachyderm/src/server/pkg/cmdutil"
@@ -33,7 +33,7 @@ const (
 )
 
 // Cmds returns a slice containing pps commands.
-func Cmds(address string, noMetrics *bool) ([]*cobra.Command, error) {
+func Cmds(noMetrics *bool) ([]*cobra.Command, error) {
 	metrics := !*noMetrics
 	raw := false
 	rawFlag := func(cmd *cobra.Command) {
@@ -68,7 +68,7 @@ The increase the throughput of a job increase the Shard paremeter.
 		Short: "Return info about a job.",
 		Long:  "Return info about a job.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -96,20 +96,20 @@ The increase the throughput of a job increase the Shard paremeter.
 
 Examples:
 
-	` + codestart + `# return all jobs
-	$ pachctl list-job
+` + codestart + `# return all jobs
+$ pachctl list-job
 
-	# return all jobs in pipeline foo
-	$ pachctl list-job -p foo
+# return all jobs in pipeline foo
+$ pachctl list-job -p foo
 
-	# return all jobs whose input commits include foo/XXX and bar/YYY
-	$ pachctl list-job foo/XXX bar/YYY
+# return all jobs whose input commits include foo/XXX and bar/YYY
+$ pachctl list-job foo/XXX bar/YYY
 
-	# return all jobs in pipeline foo and whose input commits include bar/YYY
-	$ pachctl list-job -p foo bar/YYY
+# return all jobs in pipeline foo and whose input commits include bar/YYY
+$ pachctl list-job -p foo bar/YYY
 ` + codeend,
 		Run: cmdutil.RunFixedArgs(0, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -152,7 +152,7 @@ Examples:
 		Short: "Delete a job.",
 		Long:  "Delete a job.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -168,7 +168,7 @@ Examples:
 		Short: "Stop a job.",
 		Long:  "Stop a job.  The job will be stopped immediately.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -184,7 +184,7 @@ Examples:
 		Short: "Restart a datum.",
 		Long:  "Restart a datum.",
 		Run: cmdutil.RunFixedArgs(2, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return fmt.Errorf("error connecting to pachd: %v", sanitizeErr(err))
 			}
@@ -209,6 +209,7 @@ Examples:
 	var (
 		jobID       string
 		commaInputs string // comma-separated list of input files of interest
+		master      bool
 	)
 	getLogs := &cobra.Command{
 		Use:   "get-logs [--pipeline=<pipeline>|--job=<job id>]",
@@ -217,17 +218,17 @@ Examples:
 
 Examples:
 
-	` + codestart + `# return logs emitted by recent jobs in the "filter" pipeline
-	$ pachctl get-logs --pipeline=filter
+` + codestart + `# return logs emitted by recent jobs in the "filter" pipeline
+$ pachctl get-logs --pipeline=filter
 
-	# return logs emitted by the job aedfa12aedf
-	$ pachctl get-logs --job=aedfa12aedf
+# return logs emitted by the job aedfa12aedf
+$ pachctl get-logs --job=aedfa12aedf
 
-	# return logs emitted by the pipeline \"filter\" while processing /apple.txt and a file with the hash 123aef
-	$ pachctl get-logs --pipeline=filter --inputs=/apple.txt,123aef
+# return logs emitted by the pipeline \"filter\" while processing /apple.txt and a file with the hash 123aef
+$ pachctl get-logs --pipeline=filter --inputs=/apple.txt,123aef
 ` + codeend,
 		Run: cmdutil.RunFixedArgs(0, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return fmt.Errorf("error connecting to pachd: %v", sanitizeErr(err))
 			}
@@ -251,7 +252,7 @@ Examples:
 
 			// Issue RPC
 			marshaler := &jsonpb.Marshaler{}
-			iter := client.GetLogs(pipelineName, jobID, data)
+			iter := client.GetLogs(pipelineName, jobID, data, master)
 			for iter.Next() {
 				var messageStr string
 				if raw {
@@ -260,13 +261,11 @@ Examples:
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "error marshalling \"%v\": %s\n", iter.Message(), err)
 					}
-				} else {
-					if iter.Message().User {
-						messageStr = iter.Message().Message
-					}
-				}
-				if messageStr != "" {
 					fmt.Println(messageStr)
+				} else if iter.Message().User {
+					fmt.Print(iter.Message().Message)
+				} else if iter.Message().Master && master {
+					fmt.Println(iter.Message().Message)
 				}
 			}
 			return iter.Err()
@@ -278,6 +277,7 @@ Examples:
 		"this job (accepts job ID)")
 	getLogs.Flags().StringVar(&commaInputs, "inputs", "", "Filter for log lines "+
 		"generated while processing these files (accepts PFS paths or file hashes)")
+	getLogs.Flags().BoolVar(&master, "master", false, "Return log messages from the master process (pipeline must be set).")
 	getLogs.Flags().BoolVar(&raw, "raw", false, "Return log messages verbatim from server.")
 
 	pipeline := &cobra.Command{
@@ -301,7 +301,6 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 	var username string
 	var password string
 	var pipelinePath string
-	var description string
 	createPipeline := &cobra.Command{
 		Use:   "create-pipeline -f pipeline.json",
 		Short: "Create a new pipeline.",
@@ -311,7 +310,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 			if err != nil {
 				return err
 			}
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return sanitizeErr(err)
 			}
@@ -333,7 +332,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 					request.Transform.Image = pushedImage
 				}
 				if _, err := client.PpsAPIClient.CreatePipeline(
-					context.Background(),
+					client.Ctx(),
 					request,
 				); err != nil {
 					return sanitizeErr(err)
@@ -347,8 +346,8 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 	createPipeline.Flags().StringVarP(&registry, "registry", "r", "docker.io", "The registry to push images to.")
 	createPipeline.Flags().StringVarP(&username, "username", "u", "", "The username to push images as, defaults to your OS username.")
 	createPipeline.Flags().StringVarP(&password, "password", "", "", "Your password for the registry being pushed to.")
-	createPipeline.Flags().StringVarP(&description, "description", "d", "", "A description of the repo.")
 
+	var reprocess bool
 	updatePipeline := &cobra.Command{
 		Use:   "update-pipeline -f pipeline.json",
 		Short: "Update an existing Pachyderm pipeline.",
@@ -358,7 +357,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 			if err != nil {
 				return err
 			}
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return sanitizeErr(err)
 			}
@@ -370,6 +369,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 					return err
 				}
 				request.Update = true
+				request.Reprocess = reprocess
 				if pushImages {
 					pushedImage, err := pushImage(registry, username, password, request.Transform.Image)
 					if err != nil {
@@ -378,7 +378,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 					request.Transform.Image = pushedImage
 				}
 				if _, err := client.PpsAPIClient.CreatePipeline(
-					context.Background(),
+					client.Ctx(),
 					request,
 				); err != nil {
 					return sanitizeErr(err)
@@ -392,13 +392,14 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 	updatePipeline.Flags().StringVarP(&registry, "registry", "r", "docker.io", "The registry to push images to.")
 	updatePipeline.Flags().StringVarP(&username, "username", "u", "", "The username to push images as, defaults to your OS username.")
 	updatePipeline.Flags().StringVarP(&password, "password", "", "", "Your password for the registry being pushed to.")
+	updatePipeline.Flags().BoolVar(&reprocess, "reprocess", false, "If true, reprocess datums that were already processed by previous version of the pipeline.")
 
 	inspectPipeline := &cobra.Command{
 		Use:   "inspect-pipeline pipeline-name",
 		Short: "Return info about a pipeline.",
 		Long:  "Return info about a pipeline.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -422,7 +423,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 		Short: "Return info about all pipelines.",
 		Long:  "Return info about all pipelines.",
 		Run: cmdutil.RunFixedArgs(0, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -456,7 +457,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 		Short: "Delete a pipeline.",
 		Long:  "Delete a pipeline.",
 		Run: cmdutil.RunBoundedArgs(0, 1, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -467,17 +468,21 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 				return fmt.Errorf("either a pipeline name or the --all flag needs to be provided")
 			}
 			if all {
-				_, err = client.PpsAPIClient.DeletePipeline(context.Background(), &ppsclient.DeletePipelineRequest{
-					All:        all,
-					DeleteJobs: deleteJobs,
-					DeleteRepo: deleteRepo,
-				})
+				_, err = client.PpsAPIClient.DeletePipeline(
+					client.Ctx(),
+					&ppsclient.DeletePipelineRequest{
+						All:        all,
+						DeleteJobs: deleteJobs,
+						DeleteRepo: deleteRepo,
+					})
 			} else {
-				_, err = client.PpsAPIClient.DeletePipeline(context.Background(), &ppsclient.DeletePipelineRequest{
-					Pipeline:   &ppsclient.Pipeline{args[0]},
-					DeleteJobs: deleteJobs,
-					DeleteRepo: deleteRepo,
-				})
+				_, err = client.PpsAPIClient.DeletePipeline(
+					client.Ctx(),
+					&ppsclient.DeletePipelineRequest{
+						Pipeline:   &ppsclient.Pipeline{args[0]},
+						DeleteJobs: deleteJobs,
+						DeleteRepo: deleteRepo,
+					})
 			}
 			if err != nil {
 				return fmt.Errorf("error from delete-pipeline: %s", err)
@@ -494,7 +499,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 		Short: "Restart a stopped pipeline.",
 		Long:  "Restart a stopped pipeline.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -510,7 +515,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 		Short: "Stop a running pipeline.",
 		Long:  "Stop a running pipeline.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -527,7 +532,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 		Short: "Run a pipeline once.",
 		Long:  "Run a pipeline once, optionally overriding some pipeline options by providing a [pipeline spec](http://docs.pachyderm.io/en/latest/reference/pipeline_spec.html).  For example run a web scraper pipelien without any explicit input.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) (retErr error) {
-			client, err := pach.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := pachdclient.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -563,7 +568,7 @@ All jobs created by a pipeline will create commits in the pipeline's repo.
 			}
 
 			job, err := client.PpsAPIClient.CreateJob(
-				context.Background(),
+				client.Ctx(),
 				request,
 			)
 			if err != nil {

@@ -19,7 +19,7 @@ import (
 func PrintJobHeader(w io.Writer) {
 	// because STATE is a colorful field it has to be at the end of the line,
 	// otherwise the terminal escape characters will trip up the tabwriter
-	fmt.Fprint(w, "ID\tOUTPUT COMMIT\tSTARTED\tDURATION\tRESTART\tPROGRESS\tSTATE\t\n")
+	fmt.Fprint(w, "ID\tOUTPUT COMMIT\tSTARTED\tDURATION\tRESTART\tPROGRESS\tDL\tUL\tSTATE\t\n")
 }
 
 // PrintJobInfo pretty-prints job info.
@@ -34,12 +34,14 @@ func PrintJobInfo(w io.Writer, jobInfo *ppsclient.JobInfo) {
 	}
 	fmt.Fprintf(w, "%s\t", pretty.Ago(jobInfo.Started))
 	if jobInfo.Finished != nil {
-		fmt.Fprintf(w, "%s\t", pretty.Duration(jobInfo.Started, jobInfo.Finished))
+		fmt.Fprintf(w, "%s\t", pretty.TimeDifference(jobInfo.Started, jobInfo.Finished))
 	} else {
 		fmt.Fprintf(w, "-\t")
 	}
 	fmt.Fprintf(w, "%d\t", jobInfo.Restart)
-	fmt.Fprintf(w, "%d / %d\t", jobInfo.DataProcessed, jobInfo.DataTotal)
+	fmt.Fprintf(w, "%d + %d / %d\t", jobInfo.DataProcessed, jobInfo.DataSkipped, jobInfo.DataTotal)
+	fmt.Fprintf(w, "%s\t", pretty.Size(jobInfo.Stats.DownloadBytes))
+	fmt.Fprintf(w, "%s\t", pretty.Size(jobInfo.Stats.UploadBytes))
 	fmt.Fprintf(w, "%s\t\n", jobState(jobInfo.State))
 }
 
@@ -75,7 +77,7 @@ func PrintJobInput(w io.Writer, jobInput *ppsclient.JobInput) {
 
 // PrintWorkerStatusHeader pretty prints a worker status header.
 func PrintWorkerStatusHeader(w io.Writer) {
-	fmt.Fprint(w, "WORKER\tJOB\tDATUM\tSTARTED\t\n")
+	fmt.Fprint(w, "WORKER\tJOB\tDATUM\tSTARTED\tQUEUE\t\n")
 }
 
 // PrintWorkerStatus pretty prints a worker status.
@@ -86,7 +88,8 @@ func PrintWorkerStatus(w io.Writer, workerStatus *ppsclient.WorkerStatus) {
 		fmt.Fprintf(w, datum.Path)
 	}
 	fmt.Fprintf(w, "\t")
-	fmt.Fprintf(w, "%s\t\n", pretty.Ago(workerStatus.Started))
+	fmt.Fprintf(w, "%s\t", pretty.Ago(workerStatus.Started))
+	fmt.Fprintf(w, "%d\t\n", workerStatus.QueueSize)
 }
 
 // PrintPipelineInputHeader prints a pipeline input header.
@@ -118,9 +121,16 @@ func PrintDetailedJobInfo(jobInfo *ppsclient.JobInfo) error {
 Pipeline: {{.Pipeline.Name}} {{end}} {{if .ParentJob}}
 Parent: {{.ParentJob.ID}} {{end}}
 Started: {{prettyAgo .Started}} {{if .Finished}}
-Duration: {{prettyDuration .Started .Finished}} {{end}}
+Duration: {{prettyTimeDifference .Started .Finished}} {{end}}
 State: {{jobState .State}}
-Progress: {{.DataProcessed}} / {{.DataTotal}}
+Processed: {{.DataProcessed}}
+Skipped: {{.DataSkipped}}
+Total: {{.DataTotal}}
+Data Downloaded: {{prettySize .Stats.DownloadBytes}}
+Data Uploaded: {{prettySize .Stats.UploadBytes}}
+Download Time: {{prettyDuration .Stats.DownloadTime}}
+Process Time: {{prettyDuration .Stats.ProcessTime}}
+Upload Time: {{prettyDuration .Stats.UploadTime}}
 Worker Status:
 {{workerStatus .}}Restarts: {{.Restart}}
 ParallelismSpec: {{.ParallelismSpec}}
@@ -187,8 +197,8 @@ func jobState(jobState ppsclient.JobState) string {
 		return color.New(color.FgRed).SprintFunc()("failure")
 	case ppsclient.JobState_JOB_SUCCESS:
 		return color.New(color.FgGreen).SprintFunc()("success")
-	case ppsclient.JobState_JOB_STOPPED:
-		return color.New(color.FgYellow).SprintFunc()("stopped")
+	case ppsclient.JobState_JOB_KILLED:
+		return color.New(color.FgYellow).SprintFunc()("killed")
 	}
 	return "-"
 }
@@ -203,8 +213,8 @@ func pipelineState(pipelineState ppsclient.PipelineState) string {
 		return color.New(color.FgYellow).SprintFunc()("restarting")
 	case ppsclient.PipelineState_PIPELINE_FAILURE:
 		return color.New(color.FgRed).SprintFunc()("failure")
-	case ppsclient.PipelineState_PIPELINE_STOPPED:
-		return color.New(color.FgYellow).SprintFunc()("stopped")
+	case ppsclient.PipelineState_PIPELINE_PAUSED:
+		return color.New(color.FgYellow).SprintFunc()("paused")
 	}
 	return "-"
 }
@@ -280,13 +290,15 @@ func shorthandInput(input *ppsclient.Input) string {
 }
 
 var funcMap = template.FuncMap{
-	"pipelineState":   pipelineState,
-	"jobState":        jobState,
-	"workerStatus":    workerStatus,
-	"pipelineInput":   pipelineInput,
-	"jobInput":        jobInput,
-	"prettyAgo":       pretty.Ago,
-	"prettyDuration":  pretty.Duration,
-	"jobCounts":       jobCounts,
-	"prettyTransform": prettyTransform,
+	"pipelineState":        pipelineState,
+	"jobState":             jobState,
+	"workerStatus":         workerStatus,
+	"pipelineInput":        pipelineInput,
+	"jobInput":             jobInput,
+	"prettyAgo":            pretty.Ago,
+	"prettyTimeDifference": pretty.TimeDifference,
+	"prettyDuration":       pretty.Duration,
+	"prettySize":           pretty.Size,
+	"jobCounts":            jobCounts,
+	"prettyTransform":      prettyTransform,
 }

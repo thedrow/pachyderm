@@ -120,6 +120,10 @@ docker-clean-test:
 docker-build-test: docker-clean-test docker-build-compile
 	docker run --name test_compile $(COMPILE_RUN_ARGS) pachyderm_compile sh etc/compile/compile_test.sh
 	etc/compile/wait.sh test_compile
+	docker tag pachyderm_test:latest pachyderm/test:`git rev-list HEAD --max-count=1`
+
+docker-push-test:
+	docker push pachyderm/test:`git rev-list HEAD --max-count=1`
 
 docker-build-microsoft-vhd:
 	docker build -t microsoft_vhd etc/microsoft/create-blank-vhd
@@ -197,12 +201,18 @@ install-bench: install
 	rm /usr/local/bin/pachctl || true
 	[ -f /usr/local/bin/pachctl ] || sudo ln -s $(GOPATH)/bin/pachctl /usr/local/bin/pachctl
 
-launch-dev-test: docker-build-test
-	kubectl run bench --image=pachyderm/test:local \
+launch-dev-test: docker-build-test docker-push-test
+	sudo kubectl run bench --image=pachyderm/test:`git rev-list HEAD --max-count=1` \
 	    --restart=Never \
 	    --attach=true \
 	    -- \
 	    ./test -test.v
+
+aws-test: tag-images push-images
+	ZONE=sa-east-1a etc/testing/deploy/aws.sh --create
+	$(MAKE) launch-dev-test
+	rm $(HOME)/.pachyderm/config.json
+	ZONE=sa-east-1a etc/testing/deploy/aws.sh --delete
 
 run-bench:
 	kubectl scale --replicas=4 deploy/pachd
@@ -303,13 +313,16 @@ pretest:
 
 #test: pretest test-client clean-launch-test-rethinkdb launch-test-rethinkdb test-fuse test-local docker-build docker-build-netcat clean-launch-dev launch-dev integration-tests example-tests
 
+local-test: docker-build launch-dev test-pfs test-hashtree clean-launch-dev 
+
 test: docker-build clean-launch-dev launch-dev test-pfs test-pps test-hashtree
 
 test-pfs:
+	@# don't run this in verbose mode, as it produces a huge amount of logs
 	go test ./src/server/pfs/server -timeout $(TIMEOUT)
 
 test-pps:
-	go test -v ./src/server/ -timeout $(TIMEOUT)
+	go test -v ./src/server -timeout $(TIMEOUT)
 
 test-hashtree:
 	go test ./src/server/pkg/hashtree -timeout $(TIMEOUT)

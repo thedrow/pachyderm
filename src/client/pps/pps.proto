@@ -41,7 +41,7 @@ enum JobState {
   JOB_RUNNING = 1;
   JOB_FAILURE = 2;
   JOB_SUCCESS = 3;
-  JOB_STOPPED = 4;
+  JOB_KILLED = 4;
 }
 
 message Service {
@@ -73,24 +73,14 @@ message JobInput {
 }
 
 message ParallelismSpec {
-  // Which Parallelism strategy to use. Depending on the value of
-  // 'strategy', other messages in the spec will or will not be set.
-  enum Strategy {
-    CONSTANT = 0;
-    COEFFICIENT = 1;
-  }
-  Strategy strategy = 1;
+  reserved 1;
 
-  // If 'strategy' is set to CONSTANT, then the field 'constant' is used.
-  //
   // Starts the pipeline/job with a 'constant' workers, unless 'constant' is
   // zero. If 'constant' is zero (which is the zero value of ParallelismSpec),
   // then Pachyderm will choose the number of workers that is started,
   // (currently it chooses the number of workers in the cluster)
   uint64 constant = 2;
 
-  // If 'strategy' is set to COEFFICIENT, then the field 'coefficient' is used.
-  //
   // Starts the pipeline/job with number of workers equal to 'coefficient' * N,
   // where N is the number of nodes in the kubernetes cluster.
   //
@@ -110,12 +100,38 @@ message Datum {
   bytes hash = 5;
 }
 
+message Aggregate {
+  int64 count = 1;
+  double mean = 2;
+  double stddev = 3;
+  double fifth_percentile = 4;
+  double ninety_fifth_percentile = 5;
+}
+
+message ProcessStats {
+  google.protobuf.Duration download_time = 1;
+  google.protobuf.Duration process_time = 2;
+  google.protobuf.Duration upload_time = 3;
+  uint64 download_bytes = 4;
+  uint64 upload_bytes = 5;
+}
+
+message AggregateProcessStats {
+  Aggregate download_time = 1;
+  Aggregate process_time = 2;
+  Aggregate upload_time = 3;
+  Aggregate download_bytes = 4;
+  Aggregate upload_bytes = 5;
+}
+
 message WorkerStatus {
   string worker_id = 1 [(gogoproto.customname) = "WorkerID"];
   string job_id = 2 [(gogoproto.customname) = "JobID"];
   repeated pps.Datum data = 3;
   // Started is the time processing on the current datum began.
   google.protobuf.Timestamp started = 4;
+  ProcessStats stats = 5;
+  int64 queue_size = 6;
 }
 
 // ResourceSpec describes the amount of resources that pipeline pods should
@@ -137,7 +153,6 @@ message JobInfo {
   reserved 4;
   Job job = 1;
   Transform transform = 2;
-  string pipeline_id = 19 [(gogoproto.customname) = "PipelineID"];
   Pipeline pipeline = 3;
   uint64 pipeline_version = 13;
   ParallelismSpec parallelism_spec = 12;
@@ -153,12 +168,18 @@ message JobInfo {
   string output_branch = 17;
   uint64 restart = 20;
   int64 data_processed = 22;
+  int64 data_skipped = 30;
   int64 data_total = 23;
+  ProcessStats stats = 31;
   repeated WorkerStatus worker_status = 24;
   ResourceSpec resource_spec = 25;
   Input input = 26;
-  pfs.Branch new_branch = 27;
+  pfs.BranchInfo new_branch = 27;
   bool incremental = 28;
+  pfs.Commit stats_commit = 29;
+  bool enable_stats = 32;
+  string salt = 33;
+  bool batch = 34;
 }
 
 enum WorkerState {
@@ -204,8 +225,8 @@ enum PipelineState {
   PIPELINE_RESTARTING = 2;
   // We have retried too many times and we have given up on this pipeline.
   PIPELINE_FAILURE = 3;
-  // The pipeline has been explicitly stopped by the user.
-  PIPELINE_STOPPED = 4;
+  // The pipeline has been explicitly paused by the user.
+  PIPELINE_PAUSED = 4;
 }
 
 message PipelineInfo {
@@ -227,6 +248,11 @@ message PipelineInfo {
   Input input = 20;
   string description = 21;
   bool incremental = 22;
+  string cache_size = 23;
+  bool enable_stats = 24;
+  string salt = 25;
+  string capability = 26;
+  bool batch = 27;
 }
 
 message PipelineInfos {
@@ -249,8 +275,11 @@ message CreateJobRequest {
   Job parent_job = 13;
   ResourceSpec resource_spec = 14;
   Input input = 15;
-  pfs.Branch new_branch = 16;
+  pfs.BranchInfo new_branch = 16;
   bool incremental = 17;
+  bool enable_stats = 18;
+  string salt = 19;
+  bool batch = 20;
 }
 
 message InspectJobRequest {
@@ -285,6 +314,11 @@ message GetLogsRequest {
   // filter may be an absolute path of a file within a pps repo, or it may be
   // a hash for that file (to search for files at specific versions)
   repeated string data_filters = 3;
+
+  string datum_id = 4 [(gogoproto.customname) = "DatumID"];
+
+  // If true get logs from the master process
+  bool master = 5;
 }
 
 // LogMessage is a log line from a PPS worker, annotated with metadata
@@ -293,9 +327,10 @@ message LogMessage {
   // The job and pipeline for which a PFS file is being processed (if the job
   // is an orphan job, pipeline name and ID will be unset)
   string pipeline_name = 1;
-  string pipeline_id = 2 [(gogoproto.customname) = "PipelineID"];
   string job_id = 3 [(gogoproto.customname) = "JobID"];
   string worker_id = 7 [(gogoproto.customname) = "WorkerID"];
+  string datum_id = 9 [(gogoproto.customname) = "DatumID"];
+  bool master = 10;
 
   // The PFS files being processed (one per pipeline/job input)
   repeated Datum data = 4;
@@ -327,6 +362,12 @@ message CreatePipelineRequest {
   Input input = 13;
   string description = 14;
   bool incremental = 15;
+  string cache_size = 16;
+  bool enable_stats = 17;
+  // Reprocess forces the pipeline to reprocess all datums.
+  // It only has meaning if Update is true
+  bool reprocess = 18;
+  bool batch = 19;
 }
 
 message InspectPipelineRequest {

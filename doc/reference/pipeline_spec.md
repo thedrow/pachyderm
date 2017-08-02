@@ -11,6 +11,7 @@ create-pipeline](../pachctl/pachctl_create-pipeline.html) doc.
   "pipeline": {
     "name": string
   },
+  "description": string,
   "transform": {
     "image": string,
     "cmd": [ string ],
@@ -20,29 +21,30 @@ create-pipeline](../pachctl/pachctl_create-pipeline.html) doc.
     },
     "secrets": [ {
         "name": string,
-        "mountPath": string
+        "mount_path": string
     } ],
-    "imagePullSecrets": [ string ],
-    "acceptReturnCode": [ int ]
+    "image_pull_secrets": [ string ],
+    "accept_return_code": [ int ]
   },
   "parallelism_spec": {
-    "strategy": "CONSTANT"|"COEFFICIENT"
-    "constant": int        // if strategy == CONSTANT
-    "coefficient": double  // if strategy == COEFFICIENT
+    // Set at most one of the following:
+    "constant": int
+    "coefficient": double
   },
   "resource_spec": {
     "memory": string
     "cpu": double
   },
   "input": {
-    <"atom" or "cross" or "union", see below> 
+    <"atom" or "cross" or "union", see below>
   },
-  "outputBranch": string,
+  "output_branch": string,
   "egress": {
     "URL": "s3://bucket/dir"
   },
-  "scaleDownThreshold": string,
-  "incremental": bool
+  "scale_down_threshold": string,
+  "incremental": bool,
+  "cache_size": string
 }
 
 ------------------------------------
@@ -62,7 +64,7 @@ create-pipeline](../pachctl/pachctl_create-pipeline.html) doc.
 "cross" or "union" input
 ------------------------------------
 
-"cross" or "union": [ 
+"cross" or "union": [
   {
     "atom": {
       "name": string,
@@ -115,6 +117,10 @@ Following is a walk-through of all the fields.
 `pipeline.name` is the name of the pipeline that you are creating.  Each
 pipeline needs to have a unique name.
 
+### Description (optional)
+
+`description` is an optional text field where you can put documentation about the pipeline.
+
 ### Transform (required)
 
 `transform.image` is the name of the Docker image that your jobs run in.
@@ -137,7 +143,7 @@ Secrets are useful for embedding sensitive data such as credentials. Read more
 about secrets in Kubernetes
 [here](https://kubernetes.io/docs/concepts/configuration/secret/).
 
-`transform.imagePullSecrets` is an array of image pull secrets, image pull
+`transform.image_pull_secrets` is an array of image pull secrets, image pull
 secrets are similar to secrets except that they're mounted before the
 containers are created so they can be used to provide credentials for image
 pulling. For example, if you are using a private Docker registry for your
@@ -147,10 +153,10 @@ images, you can specify it via:
 $ kubectl create secret docker-registry myregistrykey --docker-server=DOCKER_REGISTRY_SERVER --docker-username=DOCKER_USER --docker-password=DOCKER_PASSWORD --docker-email=DOCKER_EMAIL
 ```
 
-And then tell your pipeline about it via `"imagePullSecrets": [ "myregistrykey" ]`. Read more about image pull secrets
+And then tell your pipeline about it via `"image_pull_secrets": [ "myregistrykey" ]`. Read more about image pull secrets
 [here](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod).
 
-`transform.acceptReturnCode` is an array of return codes (i.e. exit codes)
+`transform.accept_return_code` is an array of return codes (i.e. exit codes)
 from your docker command that are considered acceptable, which means that
 if your docker command exits with one of the codes in this array, it will
 be considered a successful run for the purpose of setting job status.  `0`
@@ -159,19 +165,17 @@ is always considered a successful exit code.
 ### Parallelism Spec (optional)
 
 `parallelism_spec` describes how Pachyderm should parallelize your pipeline.
-Currently, Pachyderm has two parallelism strategies: `CONSTANT` and
-`COEFFICIENT`.
+Currently, Pachyderm has two parallelism strategies: `constant` and
+`coefficient`.
 
-If you use the `CONSTANT` strategy, Pachyderm will start a number of workers
-that you give it. To use this strategy, set the field `strategy` to `CONSTANT`,
-and set the field `constant` to an integer value (e.g. `10` to start 10 workers).
+If you set the `constant` field, Pachyderm will start the number of workers
+that you specify. For example, set `"constant":10` to use 10 workers.
 
-If you use the `COEFFICIENT` strategy, Pachyderm will start a number of workers
-that is a multiple of your Kubernetes cluster's size. To use this strategy, set
-the field `coefficient` to a double. For example, if your Kubernetes cluster
-has 10 nodes, and you set `coefficient` to 0.5, Pachyderm will start five
-workers. If you set it to 2.0, Pachyderm will start 20 workers (two per
-Kubernetes node).
+If you set the `coefficient` field, Pachyderm will start a number of workers
+that is a multiple of your Kubernetes cluster’s size. For example, if your
+Kubernetes cluster has 10 nodes, and you set `"coefficient": 0.5`, Pachyderm
+will start five workers. If you set it to 2.0, Pachyderm will start 20 workers
+(two per Kubernetes node).
 
 By default, we use the parallelism spec "coefficient=1", which means that
 we spawn one worker per node for this pipeline.
@@ -335,11 +339,11 @@ successful.
 
 ## Scale-down threshold (optional)
 
-`scaleDownThreshold` specifies when the worker pods of a pipeline should be terminated.
+`scale_down_threshold` specifies when the worker pods of a pipeline should be terminated.
 
-By default, a pipeline’s worker pods are always running.  When `scaleDownThreshold` is set, all but one worker pods are terminated after the pipeline has not seen a new job for the given duration (we still need one worker pod to subscribe to new input commits).  When a new input commit comes in, the worker pods are then re-created.
+by default, a pipeline’s worker pods are always running.  when `scale_down_threshold` is set, all but one worker pods are terminated after the pipeline has not seen a new job for the given duration (we still need one worker pod to subscribe to new input commits).  when a new input commit comes in, the worker pods are then re-created.
 
-`scaleDownThreshold` is a string that needs to be sequence of decimal numbers with a unit suffix, such as “300ms”, “1.5h” or “2h45m”. Valid time units are “s”, “m”, “h”.
+`scale_down_threshold` is a string that needs to be sequence of decimal numbers with a unit suffix, such as “300ms”, “1.5h” or “2h45m”. valid time units are “s”, “m”, “h”.
 
 ## Incremental (optional)
 
@@ -356,6 +360,12 @@ old total without having to reconsider the numbers which went into that old
 total. Incremental is design to work nicely with the `--split` flag to
 `put-file` because it will cause only the new chunks of the file to be
 displayed to each step of the pipeline.
+
+## Cache Size (optional)
+
+`cache_size` controls how much cache a pipeline worker uses.  In general,
+your pipeline's performance will increase with the cache size, but only
+up to a certain point depending on your workload.
 
 ## The Input Glob Pattern
 

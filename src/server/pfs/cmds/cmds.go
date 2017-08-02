@@ -3,7 +3,6 @@ package cmds
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,7 +38,7 @@ const (
 )
 
 // Cmds returns a slice containing pfs commands.
-func Cmds(address string, noMetrics *bool) []*cobra.Command {
+func Cmds(noMetrics *bool) []*cobra.Command {
 	metrics := !*noMetrics
 	raw := false
 	rawFlag := func(cmd *cobra.Command) {
@@ -64,13 +63,12 @@ func Cmds(address string, noMetrics *bool) []*cobra.Command {
 		Short: "Create a new repo.",
 		Long:  "Create a new repo.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			c, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			c, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
-
 			_, err = c.PfsAPIClient.CreateRepo(
-				context.Background(),
+				c.Ctx(),
 				&pfsclient.CreateRepoRequest{
 					Repo:        client.NewRepo(args[0]),
 					Description: description,
@@ -86,7 +84,7 @@ func Cmds(address string, noMetrics *bool) []*cobra.Command {
 		Short: "Return info about a repo.",
 		Long:  "Return info about a repo.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -111,7 +109,7 @@ func Cmds(address string, noMetrics *bool) []*cobra.Command {
 		Short: "Return all repos.",
 		Long:  "Reutrn all repos.",
 		Run: cmdutil.RunFixedArgs(0, func(args []string) error {
-			c, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			c, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -145,7 +143,7 @@ func Cmds(address string, noMetrics *bool) []*cobra.Command {
 		Short: "Delete a repo.",
 		Long:  "Delete a repo.",
 		Run: cmdutil.RunBoundedArgs(0, 1, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -156,10 +154,11 @@ func Cmds(address string, noMetrics *bool) []*cobra.Command {
 				return fmt.Errorf("either a repo name or the --all flag needs to be provided")
 			}
 			if all {
-				_, err = client.PfsAPIClient.DeleteRepo(context.Background(), &pfsclient.DeleteRepoRequest{
-					Force: force,
-					All:   all,
-				})
+				_, err = client.PfsAPIClient.DeleteRepo(client.Ctx(),
+					&pfsclient.DeleteRepoRequest{
+						Force: force,
+						All:   all,
+					})
 			} else {
 				err = client.DeleteRepo(args[0], force)
 			}
@@ -214,7 +213,7 @@ $ pachctl start-commit test patch -p master
 $ pachctl start-commit test -p XXX
 ` + codeend,
 		Run: cmdutil.RunBoundedArgs(1, 2, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -237,7 +236,7 @@ $ pachctl start-commit test -p XXX
 		Short: "Finish a started commit.",
 		Long:  "Finish a started commit. Commit-id must be a writeable commit.",
 		Run: cmdutil.RunFixedArgs(2, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -250,7 +249,7 @@ $ pachctl start-commit test -p XXX
 		Short: "Return info about a commit.",
 		Long:  "Return info about a commit.",
 		Run: cmdutil.RunFixedArgs(2, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -294,7 +293,7 @@ $ pachctl list-commit foo XXX
 $ pachctl list-commit foo master --from XXX
 ` + codeend,
 		Run: cmdutil.RunBoundedArgs(1, 2, func(args []string) (retErr error) {
-			c, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			c, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -382,7 +381,7 @@ $ pachctl flush-commit foo/XXX -r bar -r baz
 				return err
 			}
 
-			c, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			c, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -426,7 +425,7 @@ $ pachctl subscribe-commit test master --new
 ` + codeend,
 		Run: cmdutil.RunFixedArgs(2, func(args []string) error {
 			repo, branch := args[0], args[1]
-			c, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			c, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -456,7 +455,7 @@ $ pachctl subscribe-commit test master --new
 		Short: "Delete an unfinished commit.",
 		Long:  "Delete an unfinished commit.",
 		Run: cmdutil.RunFixedArgs(2, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -469,7 +468,7 @@ $ pachctl subscribe-commit test master --new
 		Short: "Return all branches on a repo.",
 		Long:  "Return all branches on a repo.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -510,7 +509,7 @@ $ pachctl set-branch foo XXX master
 # same commit.
 $ pachctl set-branch foo test master` + codeend,
 		Run: cmdutil.RunFixedArgs(3, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -523,7 +522,7 @@ $ pachctl set-branch foo test master` + codeend,
 		Short: "Delete a branch",
 		Long:  "Delete a branch, while leaving the commits intact",
 		Run: cmdutil.RunFixedArgs(2, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -556,40 +555,45 @@ $ pachctl set-branch foo test master` + codeend,
 		Short: "Put a file into the filesystem.",
 		Long: `Put-file supports a number of ways to insert data into pfs:
 ` + codestart + `# Put data from stdin as repo/branch/path:
-echo "data" | pachctl put-file repo branch path
+$ echo "data" | pachctl put-file repo branch path
 
 # Put data from stding as repo/branch/path and start / finish a new commit on the branch.
-echo "data" | pachctl put-file -c repo branch path
+$ echo "data" | pachctl put-file -c repo branch path
 
 # Put a file from the local filesystem as repo/branch/path:
-pachctl put-file repo branch path -f file
+$ pachctl put-file repo branch path -f file
 
 # Put a file from the local filesystem as repo/branch/file:
-pachctl put-file repo branch -f file
+$ pachctl put-file repo branch -f file
 
 # Put the contents of a directory as repo/branch/path/dir/file:
-pachctl put-file -r repo branch path -f dir
+$ pachctl put-file -r repo branch path -f dir
 
 # Put the contents of a directory as repo/branch/dir/file:
-pachctl put-file -r repo branch -f dir
+$ pachctl put-file -r repo branch -f dir
 
 # Put the data from a URL as repo/branch/path:
-pachctl put-file repo branch path -f http://host/path
+$ pachctl put-file repo branch path -f http://host/path
 
 # Put the data from a URL as repo/branch/path:
-pachctl put-file repo branch -f http://host/path
+$ pachctl put-file repo branch -f http://host/path
 
 # Put several files or URLs that are listed in file.
 # Files and URLs should be newline delimited.
-pachctl put-file repo branch -i file
+$ pachctl put-file repo branch -i file
 
 # Put several files or URLs that are listed at URL.
 # NOTE this URL can reference local files, so it could cause you to put sensitive
 # files into your Pachyderm cluster.
-pachctl put-file repo branch -i http://host/path
-` + codeend,
+$ pachctl put-file repo branch -i http://host/path
+` + codeend + `
+NOTE there's a small performance overhead for using a branch name as opposed
+to a commit ID in put-file.  In most cases the performance overhead is
+negligible, but if you are putting a large number of small files, you might
+want to consider using commit IDs directly.
+`,
 		Run: cmdutil.RunBoundedArgs(2, 3, func(args []string) (retErr error) {
-			client, err := client.NewMetricsClientFromAddressWithConcurrency(address, metrics, "user", parallelism)
+			client, err := client.NewOnUserMachineWithConcurrency(metrics, "user", parallelism)
 			if err != nil {
 				return err
 			}
@@ -692,7 +696,7 @@ pachctl put-file repo branch -i http://host/path
 		Short: "Return the contents of a file.",
 		Long:  "Return the contents of a file.",
 		Run: cmdutil.RunFixedArgs(3, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -701,7 +705,7 @@ pachctl put-file repo branch -i http://host/path
 					return fmt.Errorf("an output path needs to be specified when using the --recursive flag")
 				}
 				puller := sync.NewPuller()
-				return puller.Pull(client, outputPath, args[0], args[1], args[2], false, int(parallelism))
+				return puller.Pull(client, outputPath, args[0], args[1], args[2], false, int(parallelism), nil, "")
 			}
 			var w io.Writer
 			// If an output path is given, print the output to stdout
@@ -727,7 +731,7 @@ pachctl put-file repo branch -i http://host/path
 		Short: "Return info about a file.",
 		Long:  "Return info about a file.",
 		Run: cmdutil.RunFixedArgs(3, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -751,7 +755,7 @@ pachctl put-file repo branch -i http://host/path
 		Short: "Return the files in a directory.",
 		Long:  "Return the files in a directory.",
 		Run: cmdutil.RunBoundedArgs(2, 3, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -783,22 +787,22 @@ pachctl put-file repo branch -i http://host/path
 	globFile := &cobra.Command{
 		Use:   "glob-file repo-name commit-id pattern",
 		Short: "Return files that match a glob pattern in a commit.",
-		Long: `Return files that match a glob pattern in a commit.
-
-The glob pattern is documented here: https://golang.org/pkg/path/filepath/#Match
+		Long: `Return files that match a glob pattern in a commit (that is, match a glob pattern
+in a repo at the state represented by a commit). Glob patterns are
+documented [here](https://golang.org/pkg/path/filepath/#Match).
 
 Examples:
 
 ` + codestart + `# Return files in repo "foo" on branch "master" that start
-with the character "A".  Note how the double quotation marks around "A*" are
-necessary because otherwise your shell might interpret the "*".
+# with the character "A".  Note how the double quotation marks around "A*" are
+# necessary because otherwise your shell might interpret the "*".
 $ pachctl glob-file foo master "A*"
 
 # Return files in repo "foo" on branch "master" under directory "data".
 $ pachctl glob-file foo master "data/*"
 ` + codeend,
 		Run: cmdutil.RunFixedArgs(3, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -837,7 +841,7 @@ $ pachctl diff-file foo master path
 $ pachctl diff-file foo master path1 bar master path2
 ` + codeend,
 		Run: cmdutil.RunBoundedArgs(3, 6, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -885,7 +889,7 @@ $ pachctl diff-file foo master path1 bar master path2
 		Short: "Delete a file.",
 		Long:  "Delete a file.",
 		Run: cmdutil.RunFixedArgs(3, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -898,7 +902,7 @@ $ pachctl diff-file foo master path1 bar master path2
 		Short: "Return the contents of an object",
 		Long:  "Return the contents of an object",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -911,7 +915,7 @@ $ pachctl diff-file foo master path1 bar master path2
 		Short: "Return the contents of a tag",
 		Long:  "Return the contents of a tag",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "user")
+			client, err := client.NewOnUserMachine(metrics, "user")
 			if err != nil {
 				return err
 			}
@@ -926,12 +930,11 @@ $ pachctl diff-file foo master path1 bar master path2
 		Short: "Mount pfs locally. This command blocks.",
 		Long:  "Mount pfs locally. This command blocks.",
 		Run: cmdutil.RunFixedArgs(1, func(args []string) error {
-			client, err := client.NewMetricsClientFromAddress(address, metrics, "fuse")
+			client, err := client.NewOnUserMachine(metrics, "fuse")
 			if err != nil {
 				return err
 			}
-			go func() { client.KeepConnected(nil) }()
-			mounter := fuse.NewMounter(address, client)
+			mounter := fuse.NewMounter(client.GetAddress(), client)
 			mountPoint := args[0]
 			ready := make(chan bool)
 			go func() {

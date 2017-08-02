@@ -34,7 +34,7 @@ var (
 	dashName                = "dash"
 	dashImage               = "pachyderm/dash"
 	grpcProxyName           = "grpc-proxy"
-	grpcProxyImage          = "pachyderm/grpc-proxy"
+	grpcProxyImage          = "pachyderm/grpc-proxy:0.3.0"
 	pachdName               = "pachd"
 	minioSecretName         = "minio-secret"
 	amazonSecretName        = "amazon-secret"
@@ -353,6 +353,11 @@ func PachdDeployment(opts *AssetOpts, objectStoreBackend backend, hostPath strin
 									ContainerPort: 651,
 									Name:          "trace-port",
 								},
+								{
+									ContainerPort: server.HTTPPort,
+									Protocol:      "TCP",
+									Name:          "api-http-port",
+								},
 							},
 							VolumeMounts: volumeMounts,
 							SecurityContext: &api.SecurityContext{
@@ -401,6 +406,11 @@ func PachdService() *v1.Service {
 					Port:     651,
 					Name:     "trace-port",
 					NodePort: 30651,
+				},
+				{
+					Port:     server.HTTPPort,
+					Name:     "api-http-port",
+					NodePort: 30000 + server.HTTPPort,
 				},
 			},
 		},

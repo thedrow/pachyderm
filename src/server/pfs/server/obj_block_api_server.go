@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -16,8 +17,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	"github.com/golang/groupcache"
-	protolion "go.pedge.io/lion"
-	protorpclog "go.pedge.io/proto/rpclog"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 
@@ -27,6 +27,7 @@ import (
 	"github.com/pachyderm/pachyderm/src/client/pkg/grpcutil"
 	"github.com/pachyderm/pachyderm/src/client/pkg/uuid"
 	"github.com/pachyderm/pachyderm/src/server/pkg/backoff"
+	"github.com/pachyderm/pachyderm/src/server/pkg/log"
 	"github.com/pachyderm/pachyderm/src/server/pkg/obj"
 	"github.com/pachyderm/pachyderm/src/server/pkg/watch"
 )
@@ -42,7 +43,7 @@ const (
 )
 
 type objBlockAPIServer struct {
-	protorpclog.Logger
+	log.Logger
 	dir         string
 	localServer *localBlockAPIServer
 	objClient   obj.Client
@@ -73,7 +74,7 @@ func newObjBlockAPIServer(dir string, cacheBytes int64, etcdAddress string, objC
 	}
 	oneCacheShare := cacheBytes / (objectCacheShares + tagCacheShares + objectInfoCacheShares)
 	s := &objBlockAPIServer{
-		Logger:           protorpclog.NewLogger("pfs.BlockAPI.Obj"),
+		Logger:           log.NewLogger("pfs.BlockAPI.Obj"),
 		dir:              dir,
 		localServer:      localServer,
 		objClient:        objClient,
@@ -89,9 +90,9 @@ func newObjBlockAPIServer(dir string, cacheBytes int64, etcdAddress string, objC
 		ticker := time.NewTicker(time.Minute)
 		for {
 			<-ticker.C
-			protolion.Infof("objectCache stats: %+v", s.objectCache.Stats)
-			protolion.Infof("tagCache stats: %+v", s.tagCache.Stats)
-			protolion.Infof("objectInfoCache stats: %+v", s.objectInfoCache.Stats)
+			logrus.Infof("objectCache stats: %+v", s.objectCache.Stats)
+			logrus.Infof("tagCache stats: %+v", s.tagCache.Stats)
+			logrus.Infof("objectInfoCache stats: %+v", s.objectInfoCache.Stats)
 		}
 	}()
 	go s.watchGC(etcdAddress)
@@ -131,7 +132,7 @@ func (s *objBlockAPIServer) watchGC(etcdAddress string) {
 			s.setGeneration(newGen)
 		}
 	}, b, func(err error, d time.Duration) error {
-		protolion.Errorf("error running GC watcher in block server: %v; retrying in %s", err, d)
+		logrus.Errorf("error running GC watcher in block server: %v; retrying in %s", err, d)
 		return nil
 	})
 }
@@ -274,7 +275,7 @@ func (s *objBlockAPIServer) GetObject(request *pfsclient.Object, getObjectServer
 	if err := s.objectCache.Get(getObjectServer.Context(), s.splitKey(request.Hash), sink); err != nil {
 		return err
 	}
-	return getObjectServer.Send(&types.BytesValue{Value: data})
+	return grpcutil.WriteToStreamingBytesServer(bytes.NewReader(data), getObjectServer)
 }
 
 func (s *objBlockAPIServer) GetObjects(request *pfsclient.GetObjectsRequest, getObjectsServer pfsclient.ObjectAPI_GetObjectsServer) (retErr error) {
@@ -289,11 +290,11 @@ func (s *objBlockAPIServer) GetObjects(request *pfsclient.GetObjectsRequest, get
 			return err
 		}
 		if objectInfo == nil {
-			protolion.Debugf("objectInfo is nil; info: %+v; request: %v", objectInfo, request)
+			logrus.Debugf("objectInfo is nil; info: %+v; request: %v", objectInfo, request)
 		} else if objectInfo.BlockRef == nil {
-			protolion.Debugf("objectInfo.BlockRef is nil; info: %+v; request: %v", objectInfo, request)
+			logrus.Debugf("objectInfo.BlockRef is nil; info: %+v; request: %v", objectInfo, request)
 		} else if objectInfo.BlockRef.Range == nil {
-			protolion.Debugf("objectInfo.BlockRef.Range is nil; info: %+v; request: %v", objectInfo, request)
+			logrus.Debugf("objectInfo.BlockRef.Range is nil; info: %+v; request: %v", objectInfo, request)
 		}
 
 		objectSize := objectInfo.BlockRef.Range.Upper - objectInfo.BlockRef.Range.Lower
@@ -323,7 +324,7 @@ func (s *objBlockAPIServer) GetObjects(request *pfsclient.GetObjectsRequest, get
 		if uint64(len(data)) < offset+readSize {
 			return fmt.Errorf("undersized object (this is likely a bug)")
 		}
-		if err := getObjectsServer.Send(&types.BytesValue{Value: data[offset : offset+readSize]}); err != nil {
+		if err := grpcutil.WriteToStreamingBytesServer(bytes.NewReader(data[offset:offset+readSize]), getObjectsServer); err != nil {
 			return err
 		}
 		// We've hit the offset so we set it to 0
@@ -709,12 +710,9 @@ func (s *objBlockAPIServer) objectGetter(ctx groupcache.Context, key string, des
 
 func (s *objBlockAPIServer) tagGetter(ctx groupcache.Context, key string, dest groupcache.Sink) error {
 	splitKey := strings.Split(key, ".")
-	if len(splitKey) != 3 {
-		return fmt.Errorf("invalid key %s (this is likely a bug)", key)
-	}
-	prefix := splitKey[0]
 	tag := &pfsclient.Tag{Name: strings.Join(splitKey[:len(splitKey)-1], "")}
-	updated := false
+	prefix := splitKey[0]
+	var updated bool
 	// First check if we already have the index for this Tag in memory, if
 	// not read it for the first time.
 	if _, ok := s.getObjectIndex(prefix); !ok {
@@ -745,7 +743,7 @@ func (s *objBlockAPIServer) tagGetter(ctx groupcache.Context, key string, dest g
 	}
 	// The last chance to find this object is to update the index since the
 	// object may have been recently incorporated into it.
-	if !updated {
+	if len(splitKey) == 3 && !updated {
 		if err := s.readObjectIndex(prefix); err != nil {
 			return err
 		}
@@ -821,7 +819,7 @@ func (s *objBlockAPIServer) readObj(path string, offset uint64, size uint64, des
 		}
 		return nil
 	}, obj.NewExponentialBackOffConfig(), func(err error, d time.Duration) error {
-		protolion.Infof("Error creating reader; retrying in %s: %#v", d, obj.RetryError{
+		logrus.Infof("Error creating reader; retrying in %s: %#v", d, obj.RetryError{
 			Err:               err.Error(),
 			TimeTillNextRetry: d.String(),
 		})
@@ -877,9 +875,9 @@ func (s *objBlockAPIServer) readObjectIndex(prefix string) error {
 func (s *objBlockAPIServer) splitKey(key string) string {
 	gen := s.getGeneration()
 	if len(key) < prefixLength {
-		return fmt.Sprintf("%s.%s", key, gen)
+		return fmt.Sprintf("%s.%d", key, gen)
 	}
-	return fmt.Sprintf("%s.%s.%s", key[:prefixLength], key[prefixLength:], gen)
+	return fmt.Sprintf("%s.%s.%d", key[:prefixLength], key[prefixLength:], gen)
 }
 
 type blockWriter struct {

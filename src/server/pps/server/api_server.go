@@ -12,24 +12,26 @@ import (
 	"time"
 
 	client "github.com/pachyderm/pachyderm/src/client"
+	"github.com/pachyderm/pachyderm/src/client/auth"
 	"github.com/pachyderm/pachyderm/src/client/limit"
 	"github.com/pachyderm/pachyderm/src/client/pfs"
 	"github.com/pachyderm/pachyderm/src/client/pkg/grpcutil"
 	"github.com/pachyderm/pachyderm/src/client/pkg/uuid"
 	"github.com/pachyderm/pachyderm/src/client/pps"
+	"github.com/pachyderm/pachyderm/src/server/pkg/backoff"
 	col "github.com/pachyderm/pachyderm/src/server/pkg/collection"
 	"github.com/pachyderm/pachyderm/src/server/pkg/hashtree"
+	"github.com/pachyderm/pachyderm/src/server/pkg/log"
 	"github.com/pachyderm/pachyderm/src/server/pkg/metrics"
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsdb"
 	"github.com/pachyderm/pachyderm/src/server/pkg/watch"
-	workerpkg "github.com/pachyderm/pachyderm/src/server/pkg/worker"
 	ppsserver "github.com/pachyderm/pachyderm/src/server/pps"
+	workerpkg "github.com/pachyderm/pachyderm/src/server/worker"
 
 	etcd "github.com/coreos/etcd/clientv3"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/types"
-	"go.pedge.io/lion/proto"
-	"go.pedge.io/proto/rpclog"
+	logrus "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -88,7 +90,7 @@ type ctxAndCancel struct {
 }
 
 type apiServer struct {
-	protorpclog.Logger
+	log.Logger
 	etcdPrefix            string
 	hasher                *ppsserver.Hasher
 	address               string
@@ -275,14 +277,20 @@ func (a *apiServer) CreateJob(ctx context.Context, request *pps.CreateJobRequest
 			ResourceSpec:    request.ResourceSpec,
 			NewBranch:       request.NewBranch,
 			Incremental:     request.Incremental,
+			Stats:           &pps.ProcessStats{},
+			EnableStats:     request.EnableStats,
+			Salt:            request.Salt,
+			PipelineVersion: request.PipelineVersion,
+			Batch:           request.Batch,
 		}
 		if request.Pipeline != nil {
 			pipelineInfo := new(pps.PipelineInfo)
 			if err := a.pipelines.ReadWrite(stm).Get(request.Pipeline.Name, pipelineInfo); err != nil {
 				return err
 			}
-			jobInfo.PipelineVersion = pipelineInfo.Version
-			jobInfo.PipelineID = pipelineInfo.ID
+			if jobInfo.Salt != pipelineInfo.Salt || jobInfo.PipelineVersion != pipelineInfo.Version {
+				return fmt.Errorf("job is made from an outdated version of the pipeline")
+			}
 			jobInfo.Transform = pipelineInfo.Transform
 			jobInfo.ParallelismSpec = pipelineInfo.ParallelismSpec
 			jobInfo.OutputRepo = &pfs.Repo{pipelineInfo.Pipeline.Name}
@@ -290,6 +298,7 @@ func (a *apiServer) CreateJob(ctx context.Context, request *pps.CreateJobRequest
 			jobInfo.Egress = pipelineInfo.Egress
 			jobInfo.ResourceSpec = pipelineInfo.ResourceSpec
 			jobInfo.Incremental = pipelineInfo.Incremental
+			jobInfo.EnableStats = pipelineInfo.EnableStats
 		} else {
 			if jobInfo.OutputRepo == nil {
 				jobInfo.OutputRepo = &pfs.Repo{job.ID}
@@ -354,10 +363,10 @@ func (a *apiServer) InspectJob(ctx context.Context, request *pps.InspectJobReque
 	if jobInfo.State != pps.JobState_JOB_RUNNING {
 		return jobInfo, nil
 	}
-	workerPoolID := pps.PipelineRcName(jobInfo.Pipeline.Name, jobInfo.PipelineVersion)
+	workerPoolID := ppsserver.PipelineRcName(jobInfo.Pipeline.Name, jobInfo.PipelineVersion)
 	workerStatus, err := status(ctx, workerPoolID, a.etcdClient, a.etcdPrefix)
 	if err != nil {
-		protolion.Errorf("failed to get worker status with err: %s", err.Error())
+		logrus.Errorf("failed to get worker status with err: %s", err.Error())
 	} else {
 		// It's possible that the workers might be working on datums for other
 		// jobs, we omit those since they're not part of the status for this
@@ -430,7 +439,7 @@ func (a *apiServer) StopJob(ctx context.Context, request *pps.StopJobRequest) (r
 		if err := jobs.Get(request.Job.ID, jobInfo); err != nil {
 			return err
 		}
-		return a.updateJobState(stm, jobInfo, pps.JobState_JOB_STOPPED)
+		return a.updateJobState(stm, jobInfo, pps.JobState_JOB_KILLED)
 	})
 	if err != nil {
 		return nil, err
@@ -448,7 +457,7 @@ func (a *apiServer) RestartDatum(ctx context.Context, request *pps.RestartDatumR
 	if err != nil {
 		return nil, err
 	}
-	workerPoolID := pps.PipelineRcName(jobInfo.Pipeline.Name, jobInfo.PipelineVersion)
+	workerPoolID := ppsserver.PipelineRcName(jobInfo.Pipeline.Name, jobInfo.PipelineVersion)
 	if err := cancel(ctx, workerPoolID, a.etcdClient, a.etcdPrefix, request.Job.ID, request.DataFilters); err != nil {
 		return nil, err
 	}
@@ -461,7 +470,7 @@ func (a *apiServer) lookupRcNameForPipeline(ctx context.Context, pipeline *pps.P
 	if err != nil {
 		return "", fmt.Errorf("could not get pipeline information for %s: %s", pipeline.Name, err.Error())
 	}
-	return pps.PipelineRcName(pipeline.Name, pipelineInfo.Version), nil
+	return ppsserver.PipelineRcName(pipeline.Name, pipelineInfo.Version), nil
 }
 
 func (a *apiServer) GetLogs(request *pps.GetLogsRequest, apiGetLogsServer pps.API_GetLogsServer) (retErr error) {
@@ -487,22 +496,22 @@ func (a *apiServer) GetLogs(request *pps.GetLogsRequest, apiGetLogsServer pps.AP
 			return err
 		}
 	} else if request.Job != nil {
+		// If user provides a job, lookup the pipeline from the job info, and then
+		// get the pipeline RC
 		var jobInfo pps.JobInfo
 		err := a.jobs.ReadOnly(ctx).Get(request.Job.ID, &jobInfo)
 		if err != nil {
 			return fmt.Errorf("could not get job information for %s: %s", request.Job.ID, err.Error())
 		}
-
 		rcName, err = a.lookupRcNameForPipeline(ctx, jobInfo.Pipeline)
 		if err != nil {
 			return err
 		}
-	} else {
-		return fmt.Errorf("must specify either pipeline or job")
 	}
+
 	pods, err := a.rcPods(rcName)
 	if err != nil {
-		return fmt.Errorf("could not get pods in rc %s containing logs", rcName)
+		return fmt.Errorf("could not get pods in rc \"%s\" containing logs: %s", rcName, err.Error())
 	}
 	if len(pods) == 0 {
 		return fmt.Errorf("no pods belonging to the rc \"%s\" were found", rcName)
@@ -524,49 +533,69 @@ func (a *apiServer) GetLogs(request *pps.GetLogsRequest, apiGetLogsServer pps.AP
 		go func() {
 			defer close(logChs[i]) // Main thread reads from here, so must close
 			// Get full set of logs from pod i
-			result := a.kubeClient.Pods(a.namespace).GetLogs(
-				pod.ObjectMeta.Name, &api.PodLogOptions{
-					Container: client.PPSWorkerUserContainerName,
-				}).Do()
-			fullLogs, err := result.Raw()
-			if err != nil {
-				if apiStatus, ok := err.(errors.APIStatus); ok &&
-					strings.Contains(apiStatus.Status().Message, "PodInitializing") {
-					return // No logs to collect from this node, just skip it
+			err := backoff.Retry(func() error {
+				result := a.kubeClient.Pods(a.namespace).GetLogs(
+					pod.ObjectMeta.Name, &api.PodLogOptions{
+						Container: client.PPSWorkerUserContainerName,
+					}).Timeout(10 * time.Second).Do()
+				fullLogs, err := result.Raw()
+				if err != nil {
+					if apiStatus, ok := err.(errors.APIStatus); ok &&
+						strings.Contains(apiStatus.Status().Message, "PodInitializing") {
+						return nil // No logs to collect from this node yet, just skip it
+					}
+					return err
 				}
+				// Occasionally, fullLogs is truncated and contains the string
+				// 'unexpected stream type ""' at the end. I believe this is a recent
+				// bug in k8s (https://github.com/kubernetes/kubernetes/issues/47800)
+				// so we're adding a special handler for this corner case.
+				// TODO(msteffen) remove this handling once the issue is fixed
+				if bytes.HasSuffix(fullLogs, []byte("unexpected stream type \"\"")) {
+					return fmt.Errorf("interrupted log stream due to kubernetes/kubernetes/issues/47800")
+				}
+
+				// Parse pods' log lines, and filter out irrelevant ones
+				scanner := bufio.NewScanner(bytes.NewReader(fullLogs))
+				for scanner.Scan() {
+					logBytes := scanner.Bytes()
+					msg := new(pps.LogMessage)
+					if err := jsonpb.Unmarshal(bytes.NewReader(logBytes), msg); err != nil {
+						continue
+					}
+
+					// Filter out log lines that don't match on pipeline or job
+					if request.Pipeline != nil && request.Pipeline.Name != msg.PipelineName {
+						continue
+					}
+					if request.Job != nil && request.Job.ID != msg.JobID {
+						continue
+					}
+					if request.DatumID != "" && request.DatumID != msg.DatumID {
+						continue
+					}
+					if request.Master != msg.Master {
+						continue
+					}
+					if !workerpkg.MatchDatum(request.DataFilters, msg.Data) {
+						continue
+					}
+
+					// Log message passes all filters -- return it
+					select {
+					case logChs[i] <- msg:
+					case <-done:
+						return nil
+					}
+				}
+				return nil
+			}, backoff.New10sBackOff())
+
+			// Used up all retries -- no logs from worker
+			if err != nil {
 				select {
 				case errCh <- err:
 				case <-done:
-				}
-				return
-			}
-
-			// Parse pods' log lines, and filter out irrelevant ones
-			scanner := bufio.NewScanner(bytes.NewReader(fullLogs))
-			for scanner.Scan() {
-				logBytes := scanner.Bytes()
-				msg := new(pps.LogMessage)
-				if err := jsonpb.Unmarshal(bytes.NewReader(logBytes), msg); err != nil {
-					continue
-				}
-
-				// Filter out log lines that don't match on pipeline or job
-				if request.Pipeline != nil && request.Pipeline.Name != msg.PipelineName {
-					continue
-				}
-				if request.Job != nil && request.Job.ID != msg.JobID {
-					continue
-				}
-
-				if !workerpkg.MatchDatum(request.DataFilters, msg.Data) {
-					continue
-				}
-
-				// Log message passes all filters -- return it
-				select {
-				case logChs[i] <- msg:
-				case <-done:
-					return
 				}
 			}
 		}()
@@ -600,8 +629,52 @@ func (a *apiServer) validatePipeline(ctx context.Context, pipelineInfo *pps.Pipe
 	if _, err := parseResourceList(pipelineInfo.ResourceSpec); err != nil {
 		return fmt.Errorf("incorrect resource spec: %v", err)
 	}
+	if pipelineInfo.ParallelismSpec != nil {
+		if pipelineInfo.ParallelismSpec.Constant < 0 {
+			return fmt.Errorf("ParallelismSpec.Constant must be > 0")
+		}
+		if pipelineInfo.ParallelismSpec.Coefficient < 0 {
+			return fmt.Errorf("ParallelismSpec.Coefficient must be > 0")
+		}
+		if pipelineInfo.ParallelismSpec.Constant != 0 &&
+			pipelineInfo.ParallelismSpec.Coefficient != 0 {
+			return fmt.Errorf("contradictory parallelism strategies: must set at " +
+				"most one of ParallelismSpec.Constant and ParallelismSpec.Coefficient")
+		}
+	}
 	if pipelineInfo.OutputBranch == "" {
 		return fmt.Errorf("pipeline needs to specify an output branch")
+	}
+	if _, err := resource.ParseQuantity(pipelineInfo.CacheSize); err != nil {
+		return fmt.Errorf("could not parse cacheSize '%s': %v", pipelineInfo.CacheSize, err)
+	}
+	if pipelineInfo.Incremental {
+		pfsClient, err := a.getPFSClient()
+		if err != nil {
+			return err
+		}
+		// for incremental jobs we can't have shared provenance
+		var provenance []*pfs.Repo
+		for _, commit := range pps.InputCommits(pipelineInfo.Input) {
+			provenance = append(provenance, commit.Repo)
+		}
+		provMap := make(map[string]bool)
+		for _, provRepo := range provenance {
+			if provMap[provRepo.Name] {
+				return fmt.Errorf("can't create an incremental pipeline with inputs that share provenance")
+			}
+			provMap[provRepo.Name] = true
+			repoInfo, err := pfsClient.InspectRepo(ctx, &pfs.InspectRepoRequest{Repo: provRepo})
+			if err != nil {
+				return err
+			}
+			for _, provRepo := range repoInfo.Provenance {
+				if provMap[provRepo.Name] {
+					return fmt.Errorf("can't create an incremental pipeline with inputs that share provenance")
+				}
+				provMap[provRepo.Name] = true
+			}
+		}
 	}
 	return nil
 }
@@ -633,6 +706,18 @@ func (a *apiServer) CreatePipeline(ctx context.Context, request *pps.CreatePipel
 	defer func(start time.Time) { a.Log(request, response, retErr, time.Since(start)) }(time.Now())
 	metricsFn := metrics.ReportUserAction(ctx, a.reporter, "CreatePipeline")
 	defer func(start time.Time) { metricsFn(start, retErr) }(time.Now())
+
+	// Get the capability of the user
+	authClient, err := a.getAuthClient()
+	if err != nil {
+		return nil, fmt.Errorf("error dialing auth client: %v", authClient)
+	}
+
+	capabilityResp, err := authClient.GetCapability(ctx, &auth.GetCapabilityRequest{})
+	if err != nil && !auth.IsNotActivatedError(err) {
+		return nil, fmt.Errorf("error getting capability for the user: %v", err)
+	}
+
 	// First translate Inputs field to Input field.
 	if len(request.Inputs) > 0 {
 		if request.Input != nil {
@@ -642,7 +727,6 @@ func (a *apiServer) CreatePipeline(ctx context.Context, request *pps.CreatePipel
 	}
 
 	pipelineInfo := &pps.PipelineInfo{
-		ID:                 uuid.NewWithoutDashes(),
 		Pipeline:           request.Pipeline,
 		Version:            1,
 		Transform:          request.Transform,
@@ -655,10 +739,18 @@ func (a *apiServer) CreatePipeline(ctx context.Context, request *pps.CreatePipel
 		ResourceSpec:       request.ResourceSpec,
 		Description:        request.Description,
 		Incremental:        request.Incremental,
+		CacheSize:          request.CacheSize,
+		EnableStats:        request.EnableStats,
+		Salt:               uuid.NewWithoutDashes(),
+		Batch:              request.Batch,
 	}
 	setPipelineDefaults(pipelineInfo)
 	if err := a.validatePipeline(ctx, pipelineInfo); err != nil {
 		return nil, err
+	}
+
+	if capabilityResp != nil {
+		pipelineInfo.Capability = capabilityResp.Capability
 	}
 
 	pfsClient, err := a.getPFSClient()
@@ -685,11 +777,23 @@ func (a *apiServer) CreatePipeline(ctx context.Context, request *pps.CreatePipel
 				return err
 			}
 			pipelineInfo.Version = oldPipelineInfo.Version + 1
+			if !request.Reprocess {
+				pipelineInfo.Salt = oldPipelineInfo.Salt
+			}
 			pipelines.Put(pipelineName, pipelineInfo)
 			return nil
 		})
 		if err != nil {
 			return nil, err
+		}
+
+		// Revoke the old capability
+		if oldPipelineInfo.Capability != "" {
+			if _, err := authClient.RevokeAuthToken(ctx, &auth.RevokeAuthTokenRequest{
+				Token: oldPipelineInfo.Capability,
+			}); err != nil && !auth.IsNotActivatedError(err) {
+				return nil, fmt.Errorf("error revoking old capability: %v", err)
+			}
 		}
 
 		// Rename the original output branch to `outputBranch-vN`, where N
@@ -814,6 +918,14 @@ func setPipelineDefaults(pipelineInfo *pps.PipelineInfo) {
 		// Output branches default to master
 		pipelineInfo.OutputBranch = "master"
 	}
+	if pipelineInfo.CacheSize == "" {
+		pipelineInfo.CacheSize = "64M"
+	}
+	if pipelineInfo.ResourceSpec == nil && pipelineInfo.CacheSize != "" {
+		pipelineInfo.ResourceSpec = &pps.ResourceSpec{
+			Memory: pipelineInfo.CacheSize,
+		}
+	}
 }
 
 func (a *apiServer) InspectPipeline(ctx context.Context, request *pps.InspectPipelineRequest) (response *pps.PipelineInfo, retErr error) {
@@ -882,6 +994,23 @@ func (a *apiServer) DeletePipeline(ctx context.Context, request *pps.DeletePipel
 }
 
 func (a *apiServer) deletePipeline(ctx context.Context, request *pps.DeletePipelineRequest) (response *types.Empty, retErr error) {
+	pipelineInfo, err := a.InspectPipeline(ctx, &pps.InspectPipelineRequest{request.Pipeline})
+	if err != nil {
+		return nil, fmt.Errorf("pipeline %v was not found: %v", request.Pipeline.Name, err)
+	}
+	// Revoke the pipeline's capability
+	if pipelineInfo.Capability != "" {
+		authClient, err := a.getAuthClient()
+		if err != nil {
+			return nil, fmt.Errorf("error dialing auth client: %v", authClient)
+		}
+		if _, err := authClient.RevokeAuthToken(ctx, &auth.RevokeAuthTokenRequest{
+			Token: pipelineInfo.Capability,
+		}); err != nil && !auth.IsNotActivatedError(err) {
+			return nil, fmt.Errorf("error revoking old capability: %v", err)
+		}
+	}
+
 	iter, err := a.jobs.ReadOnly(ctx).GetByIndex(ppsdb.JobsPipelineIndex, request.Pipeline)
 	if err != nil {
 		return nil, err
@@ -912,7 +1041,7 @@ func (a *apiServer) deletePipeline(ctx context.Context, request *pps.DeletePipel
 					// We need to check again here because the job's state
 					// might've changed since we first retrieved it
 					if !jobStateToStopped(jobInfo.State) {
-						jobInfo.State = pps.JobState_JOB_STOPPED
+						jobInfo.State = pps.JobState_JOB_KILLED
 					}
 					jobs.Put(jobID, &jobInfo)
 					return nil
@@ -960,7 +1089,7 @@ func (a *apiServer) StopPipeline(ctx context.Context, request *pps.StopPipelineR
 	func() { a.Log(request, nil, nil, 0) }()
 	defer func(start time.Time) { a.Log(request, response, retErr, time.Since(start)) }(time.Now())
 
-	if err := a.updatePipelineState(ctx, request.Pipeline.Name, pps.PipelineState_PIPELINE_STOPPED); err != nil {
+	if err := a.updatePipelineState(ctx, request.Pipeline.Name, pps.PipelineState_PIPELINE_PAUSED); err != nil {
 		return nil, err
 	}
 	return &types.Empty{}, nil
@@ -1101,7 +1230,7 @@ func (a *apiServer) GarbageCollect(ctx context.Context, request *pps.GarbageColl
 	activeTags := make(map[string]bool)
 	for _, pipelineInfo := range pipelineInfos.PipelineInfo {
 		tags, err := objClient.ListTags(ctx, &pfs.ListTagsRequest{
-			Prefix:        client.HashPipelineID(pipelineInfo.ID),
+			Prefix:        client.DatumTagPrefix(pipelineInfo.Salt),
 			IncludeObject: true,
 		})
 		if err != nil {
@@ -1244,7 +1373,7 @@ func pipelineStateToStopped(state pps.PipelineState) bool {
 		return false
 	case pps.PipelineState_PIPELINE_RESTARTING:
 		return false
-	case pps.PipelineState_PIPELINE_STOPPED:
+	case pps.PipelineState_PIPELINE_PAUSED:
 		return true
 	case pps.PipelineState_PIPELINE_FAILURE:
 		return true
@@ -1303,52 +1432,35 @@ func jobStateToStopped(state pps.JobState) bool {
 		return true
 	case pps.JobState_JOB_FAILURE:
 		return true
-	case pps.JobState_JOB_STOPPED:
+	case pps.JobState_JOB_KILLED:
 		return true
 	default:
 		panic(fmt.Sprintf("unrecognized job state: %s", state))
 	}
 }
 
-func parseResourceList(resources *pps.ResourceSpec) (*api.ResourceList, error) {
-	cpuQuantity, err := resource.ParseQuantity(fmt.Sprintf("%f", resources.Cpu))
-	if err != nil {
-		return nil, fmt.Errorf("could not parse cpu quantity: %s", err)
-	}
-	memQuantity, err := resource.ParseQuantity(resources.Memory)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse memory quantity: %s", err)
-	}
-	gpuQuantity, err := resource.ParseQuantity(fmt.Sprintf("%d", resources.Gpu))
-	if err != nil {
-		return nil, fmt.Errorf("could not parse gpu quantity: %s", err)
-	}
-	var result api.ResourceList = map[api.ResourceName]resource.Quantity{
-		api.ResourceCPU:       cpuQuantity,
-		api.ResourceMemory:    memQuantity,
-		api.ResourceNvidiaGPU: gpuQuantity,
-	}
-	return &result, nil
-}
-
 func (a *apiServer) getPFSClient() (pfs.APIClient, error) {
-	if a.pachConn == nil {
-		var onceErr error
-		a.pachConnOnce.Do(func() {
-			pachConn, err := grpc.Dial(a.address, client.PachDialOptions()...)
-			if err != nil {
-				onceErr = err
-			}
-			a.pachConn = pachConn
-		})
-		if onceErr != nil {
-			return nil, onceErr
-		}
+	if err := a.dialPachConn(); err != nil {
+		return nil, err
 	}
 	return pfs.NewAPIClient(a.pachConn), nil
 }
 
 func (a *apiServer) getObjectClient() (pfs.ObjectAPIClient, error) {
+	if err := a.dialPachConn(); err != nil {
+		return nil, err
+	}
+	return pfs.NewObjectAPIClient(a.pachConn), nil
+}
+
+func (a *apiServer) getAuthClient() (auth.APIClient, error) {
+	if err := a.dialPachConn(); err != nil {
+		return nil, err
+	}
+	return auth.NewAPIClient(a.pachConn), nil
+}
+
+func (a *apiServer) dialPachConn() error {
 	if a.pachConn == nil {
 		var onceErr error
 		a.pachConnOnce.Do(func() {
@@ -1359,10 +1471,10 @@ func (a *apiServer) getObjectClient() (pfs.ObjectAPIClient, error) {
 			a.pachConn = pachConn
 		})
 		if onceErr != nil {
-			return nil, onceErr
+			return onceErr
 		}
 	}
-	return pfs.NewObjectAPIClient(a.pachConn), nil
+	return nil
 }
 
 // RepoNameToEnvString is a helper which uppercases a repo name for
